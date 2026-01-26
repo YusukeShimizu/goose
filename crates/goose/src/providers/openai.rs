@@ -189,7 +189,21 @@ impl OpenAiProvider {
     }
 
     fn uses_responses_api(model_name: &str) -> bool {
-        model_name.starts_with("gpt-5-codex") || model_name.starts_with("gpt-5.1-codex")
+        // Some OpenAI models are Responses API-only (and will error on Chat Completions),
+        // while others are better supported via Responses due to richer tool/stream support.
+        //
+        // Keep this check model-name based (not host based) so it also works with
+        // OpenAI-compatible providers that expose the same model IDs.
+        let name = model_name.rsplit('/').next().unwrap_or(model_name);
+
+        let is_gpt5_family = name.starts_with("gpt-5");
+        let is_o_series =
+            name.starts_with('o') && name.chars().nth(1).is_some_and(|c| c.is_ascii_digit());
+
+        let is_pro_variant = name.contains("-pro");
+        let is_codex_variant = name.contains("codex");
+
+        (is_gpt5_family && (is_codex_variant || is_pro_variant)) || (is_o_series && is_pro_variant)
     }
 
     async fn post(&self, session_id: &str, payload: &Value) -> Result<Value, ProviderError> {
@@ -505,5 +519,29 @@ impl EmbeddingCapable for OpenAiProvider {
             .into_iter()
             .map(|d| d.embedding)
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OpenAiProvider;
+
+    #[test]
+    fn uses_responses_api_for_gpt5_pro_and_codex() {
+        assert!(OpenAiProvider::uses_responses_api("gpt-5.2-pro"));
+        assert!(OpenAiProvider::uses_responses_api("gpt-5.2-pro-2025-12-11"));
+        assert!(OpenAiProvider::uses_responses_api("gpt-5.1-codex"));
+        assert!(OpenAiProvider::uses_responses_api("gpt-5.1-codex-mini"));
+        assert!(OpenAiProvider::uses_responses_api("gpt-5.2-codex"));
+        assert!(!OpenAiProvider::uses_responses_api("gpt-5.2"));
+        assert!(!OpenAiProvider::uses_responses_api("gpt-4o"));
+    }
+
+    #[test]
+    fn uses_responses_api_for_o_series_pro() {
+        assert!(OpenAiProvider::uses_responses_api("o3-pro"));
+        assert!(OpenAiProvider::uses_responses_api("o1-pro"));
+        assert!(!OpenAiProvider::uses_responses_api("o3"));
+        assert!(!OpenAiProvider::uses_responses_api("o4-mini"));
     }
 }
