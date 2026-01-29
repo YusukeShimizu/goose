@@ -48,7 +48,8 @@ static MODEL_SPECIFIC_LIMITS: Lazy<Vec<(&'static str, usize)>> = Lazy::new(|| {
     vec![
         // openai
         ("gpt-5.2-codex", 400_000), // auto-compacting context
-        ("gpt-5.2", 400_000),       // auto-compacting context
+        ("gpt-5.2-pro", 400_000),
+        ("gpt-5.2", 400_000), // auto-compacting context
         ("gpt-5.1-codex-max", 256_000),
         ("gpt-5.1-codex-mini", 256_000),
         ("gpt-4-turbo", 128_000),

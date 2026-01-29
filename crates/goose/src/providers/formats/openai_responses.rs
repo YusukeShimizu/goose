@@ -10,6 +10,30 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::ops::Deref;
 
+fn split_model_and_reasoning_effort(model_name: &str) -> (String, Option<String>) {
+    let model_id = model_name.rsplit('/').next().unwrap_or(model_name);
+    let supports_reasoning_effort = model_id.starts_with("o1")
+        || model_id.starts_with("o2")
+        || model_id.starts_with("o3")
+        || model_id.starts_with("o4")
+        || model_id.starts_with("gpt-5");
+
+    if !supports_reasoning_effort {
+        return (model_name.to_string(), None);
+    }
+
+    let Some((base, suffix)) = model_name.rsplit_once('-') else {
+        return (model_name.to_string(), None);
+    };
+
+    match suffix {
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" => {
+            (base.to_string(), Some(suffix.to_string()))
+        }
+        _ => (model_name.to_string(), None),
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ResponsesApiResponse {
     pub id: String,
@@ -377,8 +401,10 @@ pub fn create_responses_request(
     add_function_calls(&mut input_items, messages);
     add_function_call_outputs(&mut input_items, messages);
 
+    let (model_name, reasoning_effort) = split_model_and_reasoning_effort(&model_config.model_name);
+
     let mut payload = json!({
-        "model": model_config.model_name,
+        "model": model_name,
         "input": input_items,
         "store": false,  // Don't store responses on server (we replay history ourselves)
     });
@@ -407,6 +433,13 @@ pub fn create_responses_request(
             .as_object_mut()
             .unwrap()
             .insert("temperature".to_string(), json!(temp));
+    }
+
+    if let Some(effort) = reasoning_effort {
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert("reasoning".to_string(), json!({ "effort": effort }));
     }
 
     if let Some(tokens) = model_config.max_tokens {
@@ -701,5 +734,55 @@ where
         } else if let Some(usage) = final_usage {
             yield (None, Some(usage));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::create_responses_request;
+    use crate::model::ModelConfig;
+    use serde_json::json;
+
+    #[test]
+    fn create_responses_request_strips_reasoning_effort_suffix_for_gpt5_models(
+    ) -> anyhow::Result<()> {
+        let model_config = ModelConfig {
+            model_name: "gpt-5.2-pro-high".to_string(),
+            context_limit: None,
+            temperature: None,
+            max_tokens: None,
+            toolshim: false,
+            toolshim_model: None,
+            fast_model: None,
+            request_params: None,
+        };
+
+        let payload = create_responses_request(&model_config, "system", &[], &[])?;
+
+        assert_eq!(payload["model"], "gpt-5.2-pro");
+        assert_eq!(payload["reasoning"], json!({ "effort": "high" }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn create_responses_request_leaves_non_reasoning_models_unchanged() -> anyhow::Result<()> {
+        let model_config = ModelConfig {
+            model_name: "gpt-4o".to_string(),
+            context_limit: None,
+            temperature: None,
+            max_tokens: None,
+            toolshim: false,
+            toolshim_model: None,
+            fast_model: None,
+            request_params: None,
+        };
+
+        let payload = create_responses_request(&model_config, "system", &[], &[])?;
+
+        assert_eq!(payload["model"], "gpt-4o");
+        assert!(payload.get("reasoning").is_none());
+
+        Ok(())
     }
 }
