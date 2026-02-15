@@ -5,7 +5,9 @@ use anyhow::{anyhow, Error};
 use async_stream::try_stream;
 use chrono;
 use futures::Stream;
-use rmcp::model::{object, CallToolRequestParams, RawContent, Role, Tool};
+use rmcp::model::{
+    object, CallToolRequestParams, CallToolResult, RawContent, ResourceContents, Role, Tool,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::ops::Deref;
@@ -357,39 +359,51 @@ fn add_function_calls(input_items: &mut Vec<Value>, messages: &[Message]) {
     }
 }
 
+fn tool_result_output(result: &CallToolResult) -> String {
+    let output_parts: Vec<String> = result
+        .content
+        .iter()
+        .filter_map(|content| match content.deref() {
+            RawContent::Text(text) => Some(text.text.clone()),
+            RawContent::Resource(resource) => match &resource.resource {
+                ResourceContents::TextResourceContents { text, .. } => Some(text.clone()),
+                ResourceContents::BlobResourceContents { blob, .. } => {
+                    Some(format!("[Binary content: {}]", blob))
+                }
+            },
+            RawContent::Image(_) => Some("[Image content]".to_string()),
+            RawContent::ResourceLink(_) => Some("[Resource link]".to_string()),
+            RawContent::Audio(_) => Some("[Audio content]".to_string()),
+        })
+        .filter(|text| !text.is_empty())
+        .collect();
+
+    if output_parts.is_empty() {
+        if let Some(structured) = &result.structured_content {
+            return serde_json::to_string(structured).unwrap_or_else(|_| "{}".to_string());
+        }
+    }
+
+    output_parts.join("\n")
+}
+
 fn add_function_call_outputs(input_items: &mut Vec<Value>, messages: &[Message]) {
     for message in messages {
         for content in &message.content {
             if let MessageContent::ToolResponse(response) = content {
                 match &response.tool_result {
                     Ok(contents) => {
-                        let text_content: Vec<String> = contents
-                            .content
-                            .iter()
-                            .filter_map(|c| {
-                                if let RawContent::Text(t) = c.deref() {
-                                    Some(t.text.clone())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-
-                        if !text_content.is_empty() {
-                            tracing::debug!(
-                                "Sending function_call_output with call_id: {}",
-                                response.id
-                            );
-                            input_items.push(json!({
-                                "type": "function_call_output",
-                                "call_id": response.id,
-                                "output": text_content.join("\n")
-                            }));
-                        }
+                        tracing::debug!(
+                            "Sending function_call_output with call_id: {}",
+                            response.id
+                        );
+                        input_items.push(json!({
+                            "type": "function_call_output",
+                            "call_id": response.id,
+                            "output": tool_result_output(contents)
+                        }));
                     }
                     Err(error_data) => {
-                        // Handle error responses - must send them back to the API
-                        // to avoid "No tool output found" errors
                         tracing::debug!(
                             "Sending function_call_output error with call_id: {}",
                             response.id
@@ -503,11 +517,18 @@ pub fn responses_api_to_message(response: &ResponsesApiResponse) -> anyhow::Resu
             }
             ResponseOutputItem::FunctionCall {
                 id,
+                call_id,
                 name,
                 arguments,
                 ..
             } => {
-                tracing::debug!("Received FunctionCall with id: {}, name: {}", id, name);
+                let tool_request_id = call_id.clone().unwrap_or_else(|| id.clone());
+                tracing::debug!(
+                    "Received FunctionCall with id: {}, call_id: {:?}, name: {}",
+                    id,
+                    call_id,
+                    name
+                );
                 let parsed_args = if arguments.is_empty() {
                     json!({})
                 } else {
@@ -515,7 +536,7 @@ pub fn responses_api_to_message(response: &ResponsesApiResponse) -> anyhow::Resu
                 };
 
                 content.push(MessageContent::tool_request(
-                    id.clone(),
+                    tool_request_id,
                     Ok(CallToolRequestParams {
                         meta: None,
                         task: None,
@@ -760,8 +781,78 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation::message::MessageContent;
+    use crate::conversation::message::{MessageContent, ToolRequest};
     use futures::StreamExt;
+    use rmcp::model::{CallToolResult, Role};
+    use rmcp::object;
+
+    fn model_config() -> ModelConfig {
+        ModelConfig {
+            model_name: "gpt-5".to_string(),
+            context_limit: None,
+            temperature: None,
+            max_tokens: None,
+            toolshim: false,
+            toolshim_model: None,
+            fast_model: None,
+            request_params: None,
+        }
+    }
+
+    #[test]
+    fn creates_function_call_output_for_empty_tool_results() {
+        let messages = vec![
+            Message::assistant().with_tool_request(
+                "call-1",
+                Ok(CallToolRequestParams {
+                    meta: None,
+                    task: None,
+                    name: "test_tool".into(),
+                    arguments: Some(object!({"input": "value"})),
+                }),
+            ),
+            Message::user().with_tool_response("call-1", Ok(CallToolResult::success(vec![]))),
+        ];
+
+        let payload = create_responses_request(&model_config(), "system", &messages, &[]).unwrap();
+        let input = payload["input"].as_array().unwrap();
+
+        let output_item = input
+            .iter()
+            .find(|item| item["type"] == "function_call_output" && item["call_id"] == "call-1")
+            .unwrap();
+
+        assert_eq!(output_item["output"], "");
+    }
+
+    #[test]
+    fn parses_function_call_using_call_id_when_available() {
+        let response = ResponsesApiResponse {
+            id: "resp_1".to_string(),
+            object: "response".to_string(),
+            created_at: 0,
+            status: "completed".to_string(),
+            model: "gpt-5".to_string(),
+            output: vec![ResponseOutputItem::FunctionCall {
+                id: "fc_123".to_string(),
+                status: "completed".to_string(),
+                call_id: Some("call_abc".to_string()),
+                name: "test_tool".to_string(),
+                arguments: "{}".to_string(),
+            }],
+            reasoning: None,
+            usage: None,
+        };
+
+        let message = responses_api_to_message(&response).unwrap();
+        assert_eq!(message.role, Role::Assistant);
+
+        let MessageContent::ToolRequest(ToolRequest { id, .. }) = &message.content[0] else {
+            panic!("expected tool request content");
+        };
+
+        assert_eq!(id, "call_abc");
+    }
 
     #[tokio::test]
     async fn test_responses_stream_ignores_keepalive_event() -> anyhow::Result<()> {
