@@ -18,7 +18,7 @@ use futures::{StreamExt, TryStreamExt};
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{decode, decode_header, DecodingKey, Validation};
 use reqwest::header::{HeaderName, HeaderValue};
-use rmcp::model::{RawContent, Role, Tool};
+use rmcp::model::{CallToolResult, RawContent, ResourceContents, Role, Tool};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Digest;
@@ -75,6 +75,34 @@ impl ChatGptCodexAuthState {
 static CHATGPT_CODEX_AUTH_STATE: LazyLock<Arc<ChatGptCodexAuthState>> =
     LazyLock::new(|| Arc::new(ChatGptCodexAuthState::new()));
 
+fn tool_result_output(result: &CallToolResult) -> String {
+    let output_parts: Vec<String> = result
+        .content
+        .iter()
+        .filter_map(|content| match content.deref() {
+            RawContent::Text(text) => Some(text.text.clone()),
+            RawContent::Resource(resource) => match &resource.resource {
+                ResourceContents::TextResourceContents { text, .. } => Some(text.clone()),
+                ResourceContents::BlobResourceContents { blob, .. } => {
+                    Some(format!("[Binary content: {}]", blob))
+                }
+            },
+            RawContent::Image(_) => Some("[Image content]".to_string()),
+            RawContent::ResourceLink(_) => Some("[Resource link]".to_string()),
+            RawContent::Audio(_) => Some("[Audio content]".to_string()),
+        })
+        .filter(|text| !text.is_empty())
+        .collect();
+
+    if output_parts.is_empty() {
+        if let Some(structured) = &result.structured_content {
+            return serde_json::to_string(structured).unwrap_or_else(|_| "{}".to_string());
+        }
+    }
+
+    output_parts.join("\n")
+}
+
 fn build_input_items(messages: &[Message]) -> Result<Vec<Value>> {
     let mut items = Vec::new();
 
@@ -127,24 +155,11 @@ fn build_input_items(messages: &[Message]) -> Result<Vec<Value>> {
                     flush_text(&mut items, role, &mut content_items);
                     match &response.tool_result {
                         Ok(contents) => {
-                            let text_content: Vec<String> = contents
-                                .content
-                                .iter()
-                                .filter_map(|c| {
-                                    if let RawContent::Text(t) = c.deref() {
-                                        Some(t.text.clone())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect();
-                            if !text_content.is_empty() {
-                                items.push(json!({
-                                    "type": "function_call_output",
-                                    "call_id": response.id,
-                                    "output": text_content.join("\n")
-                                }));
-                            }
+                            items.push(json!({
+                                "type": "function_call_output",
+                                "call_id": response.id,
+                                "output": tool_result_output(contents)
+                            }));
                         }
                         Err(error_data) => {
                             items.push(json!({
@@ -1083,6 +1098,29 @@ mod tests {
             "function_call_output".to_string(),
         ];
         "includes tool error output"
+    )]
+    #[test_case(
+        vec![
+            Message::user().with_text("user text"),
+            Message::assistant().with_tool_request(
+                "call-1",
+                Ok(CallToolRequestParams {
+                    meta: None, task: None,
+                    name: "tool_name".into(),
+                    arguments: Some(object!({"param": "value"})),
+                }),
+            ),
+            Message::user().with_tool_response(
+                "call-1",
+                Ok(CallToolResult::success(vec![])),
+            ),
+        ],
+        vec![
+            "message:user".to_string(),
+            "function_call".to_string(),
+            "function_call_output".to_string(),
+        ];
+        "includes empty tool output"
     )]
     fn test_codex_input_order(messages: Vec<Message>, expected: Vec<String>) {
         let items = build_input_items(&messages).unwrap();
