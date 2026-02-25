@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use futures::future::BoxFuture;
 use futures::{StreamExt, TryStreamExt};
 use reqwest::StatusCode;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io;
 use tokio::pin;
@@ -50,6 +51,8 @@ pub const OPEN_AI_KNOWN_MODELS: &[(&str, usize)] = &[
     ("gpt-5-nano", 400_000),
     ("gpt-5.1-codex", 400_000),
     ("gpt-5-codex", 400_000),
+    ("gpt-5.2-codex", 400_000),
+    ("gpt-5.3-codex", 400_000),
 ];
 
 pub const OPEN_AI_DOC_URL: &str = "https://platform.openai.com/docs/models";
@@ -63,6 +66,7 @@ pub struct OpenAiProvider {
     project: Option<String>,
     model: ModelConfig,
     custom_headers: Option<HashMap<String, String>>,
+    reasoning_effort: Option<String>,
     supports_streaming: bool,
     name: String,
 }
@@ -90,6 +94,8 @@ impl OpenAiProvider {
             .unwrap_or_else(|_| OPEN_AI_DEFAULT_BASE_PATH.to_string());
         let organization: Option<String> = config.get_param("OPENAI_ORGANIZATION").ok();
         let project: Option<String> = config.get_param("OPENAI_PROJECT").ok();
+        let reasoning_effort =
+            Self::normalize_reasoning_effort(config.get_param("OPENAI_REASONING_EFFORT").ok());
         let timeout_secs: u64 = config.get_param("OPENAI_TIMEOUT").unwrap_or(600);
 
         let auth = match api_key {
@@ -124,6 +130,7 @@ impl OpenAiProvider {
             project,
             model,
             custom_headers,
+            reasoning_effort,
             supports_streaming: true,
             name: OPEN_AI_PROVIDER_NAME.to_string(),
         })
@@ -138,6 +145,7 @@ impl OpenAiProvider {
             project: None,
             model,
             custom_headers: None,
+            reasoning_effort: None,
             supports_streaming: true,
             name: OPEN_AI_PROVIDER_NAME.to_string(),
         }
@@ -154,6 +162,11 @@ impl OpenAiProvider {
         } else {
             None
         };
+        let reasoning_effort = Self::normalize_reasoning_effort(
+            global_config
+                .get_param::<String>("OPENAI_REASONING_EFFORT")
+                .ok(),
+        );
 
         let url = url::Url::parse(&config.base_url)
             .map_err(|e| anyhow::anyhow!("Invalid base URL '{}': {}", config.base_url, e))?;
@@ -202,6 +215,7 @@ impl OpenAiProvider {
             project: None,
             model,
             custom_headers: config.headers,
+            reasoning_effort,
             supports_streaming: config.supports_streaming.unwrap_or(true),
             name: config.name.clone(),
         })
@@ -245,6 +259,47 @@ impl OpenAiProvider {
         }
 
         Self::is_responses_model(model_name)
+    }
+
+    fn normalize_reasoning_effort(value: Option<String>) -> Option<String> {
+        let value = value?;
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+
+        let value = value.to_lowercase();
+        if value == "auto" {
+            return None;
+        }
+
+        match value.as_str() {
+            "none" | "low" | "medium" | "high" | "xhigh" => Some(value),
+            _ => {
+                tracing::warn!(
+                    "Invalid OPENAI_REASONING_EFFORT '{}', ignoring (valid: auto, none, low, medium, high, xhigh)",
+                    value
+                );
+                None
+            }
+        }
+    }
+
+    fn apply_responses_reasoning_settings(&self, payload: &mut Value) {
+        let effort = match self.reasoning_effort.as_deref() {
+            Some(effort) => effort,
+            None => return,
+        };
+
+        let Some(obj) = payload.as_object_mut() else {
+            return;
+        };
+
+        obj.insert("reasoning".to_string(), json!({ "effort": effort }));
+
+        if effort != "none" {
+            obj.remove("temperature");
+        }
     }
 
     fn map_base_path(base_path: &str, target: &str, fallback: &str) -> String {
@@ -300,6 +355,7 @@ impl ProviderDef for OpenAiProvider {
                     Some("v1/chat/completions"),
                     false,
                 ),
+                ConfigKey::new("OPENAI_REASONING_EFFORT", true, false, Some("auto"), false),
                 ConfigKey::new("OPENAI_ORGANIZATION", false, false, None, false),
                 ConfigKey::new("OPENAI_PROJECT", false, false, None, false),
                 ConfigKey::new("OPENAI_CUSTOM_HEADERS", false, true, None, false),
@@ -379,6 +435,7 @@ impl Provider for OpenAiProvider {
         if Self::should_use_responses_api(&model_config.model_name, &self.base_path) {
             let mut payload = create_responses_request(model_config, system, messages, tools)?;
             payload["stream"] = serde_json::Value::Bool(self.supports_streaming);
+            self.apply_responses_reasoning_settings(&mut payload);
 
             let mut log = RequestLog::start(model_config, &payload)?;
 
