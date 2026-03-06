@@ -48,6 +48,7 @@ pub const OPEN_AI_KNOWN_MODELS: &[(&str, usize)] = &[
     ("gpt-3.5-turbo", 16_385),
     ("gpt-4-turbo", 128_000),
     ("o4-mini", 128_000),
+    ("gpt-5.4", 400_000),
     ("gpt-5-nano", 400_000),
     ("gpt-5.1-codex", 400_000),
     ("gpt-5-codex", 400_000),
@@ -242,6 +243,8 @@ impl OpenAiProvider {
     fn is_responses_model(model_name: &str) -> bool {
         let normalized_model = model_name.to_ascii_lowercase();
         (normalized_model.starts_with("gpt-5") && normalized_model.contains("codex"))
+            || normalized_model == "gpt-5.4"
+            || normalized_model.starts_with("gpt-5.4-20")
             || normalized_model.starts_with("gpt-5.2-pro")
     }
 
@@ -627,6 +630,22 @@ mod tests {
     fn gpt_5_2_codex_uses_responses_when_base_path_is_default() {
         assert!(OpenAiProvider::should_use_responses_api(
             "gpt-5.2-codex",
+            "v1/chat/completions"
+        ));
+    }
+
+    #[test]
+    fn gpt_5_4_uses_responses_when_base_path_is_default() {
+        assert!(OpenAiProvider::should_use_responses_api(
+            "gpt-5.4",
+            "v1/chat/completions"
+        ));
+    }
+
+    #[test]
+    fn gpt_5_4_with_date_uses_responses() {
+        assert!(OpenAiProvider::should_use_responses_api(
+            "gpt-5.4-2026-03-06",
             "v1/chat/completions"
         ));
     }
